@@ -22,6 +22,13 @@
 #define MAX_COMMANDS 8
 #define MAX_ARGS 32
 
+/* 명령어 역할 분담
+ * 임채민: cat, grep, pwd
+ * 박재석: ls, mkdir, rmdir, rm
+ * 김시현: cd, cp, mv, ln
+ * 공동: 입력 분석, 내장 명령 연결, 파이프 및 리다이렉션, 프로세스·시그널 제어
+ */
+
 /* 명령어의 인자와 입출력 리다이렉션 정보를 저장하는 구조체 */
 typedef struct {
     char *argv[MAX_ARGS];
@@ -164,7 +171,7 @@ int parse_commands(Token tokens[], int count,
     return c + 1;
 }
 
-/* 파일의 내용을 읽어 다른 파일에 복사하는 공통 함수 */
+/* 공통 함수: cat(임채민)과 cp(김시현)가 입력 스트림을 출력 스트림으로 복사할 때 사용한다. */
 int copy_stream(FILE *src, FILE *dst) {
     char buffer[4096];
     size_t n;
@@ -177,7 +184,7 @@ int copy_stream(FILE *src, FILE *dst) {
     return ferror(src) || ferror(dst);
 }
 
-/* 디렉터리 안의 항목을 stat할 때 사용할 경로를 만든다. */
+/* 공통 함수: ls의 항목 조회와 cp·mv의 목적지 결정에 사용할 경로를 만든다. */
 static char *join_path(const char *directory, const char *name) {
     size_t length = strlen(directory);
     int slash = length > 0 && directory[length - 1] != '/';
@@ -192,6 +199,7 @@ static char *join_path(const char *directory, const char *name) {
     return joined;
 }
 
+/* 박재석 담당: ls의 파일 종류·권한 표시, 디렉터리 조회 및 옵션 처리 */
 static char file_type(mode_t mode) {
     if (S_ISDIR(mode))  return 'd';
     if (S_ISLNK(mode))  return 'l';
@@ -331,6 +339,7 @@ static int run_ls(char *argv[]) {
     return result;
 }
 
+/* 임채민 담당: grep의 옵션 해석과 파일·표준 입력의 줄 단위 검색 */
 typedef struct {
     int number_lines;
     int ignore_case;
@@ -435,7 +444,8 @@ static int run_grep(char *argv[]) {
     return result;
 }
 
-/* 대상 파일을 열고 같은 inode인지 확인한 뒤 내용을 덮어쓴다. */
+/* 김시현 담당: cp·mv에서 목적지 경로를 결정하고 파일을 복사하거나 이동한다. */
+/* cp는 두 열린 파일의 장치 번호와 inode를 비교한 뒤 대상 파일의 길이를 줄인다. */
 static int copy_file(const char *source, const char *destination) {
     FILE *input = fopen(source, "rb");
     if (!input) {
@@ -556,7 +566,7 @@ static int run_transfer(char *argv[], int move) {
     return result;
 }
 
-/* 경로 하나에 실패해도 나머지 경로는 계속 처리한다. */
+/* 박재석 담당: mkdir·rmdir·rm은 한 경로에서 실패해도 나머지 경로를 계속 처리한다. */
 static int change_paths(char *argv[]) {
     int first = argv[1] && !strcmp(argv[1], "--") ? 2 : 1;
     if (!argv[first]) {
@@ -592,7 +602,7 @@ int builtin_command(char *argv[]) {
     if (argv[0] == NULL)
         return 0;
 
-    /* pwd: 현재 작업 디렉터리의 경로를 출력한다. */
+    /* 임채민 담당 — pwd: 현재 작업 디렉터리의 경로를 출력한다. */
     if (strcmp(argv[0], "pwd") == 0) {
         char path[4096];
 
@@ -605,7 +615,7 @@ int builtin_command(char *argv[]) {
         return 0;
     }
 
-    /* cd: 현재 작업 디렉터리를 변경한다. */
+    /* 김시현 담당 — cd: 현재 작업 디렉터리를 변경한다. */
     if (strcmp(argv[0], "cd") == 0) {
         const char *path = argv[1] ? argv[1] : getenv("HOME");
 
@@ -632,7 +642,7 @@ int builtin_command(char *argv[]) {
         !strcmp(argv[0], "rm"))
         return change_paths(argv);
 
-    /* ln: 하드 링크 또는 심볼릭 링크를 생성한다. */
+    /* 김시현 담당 — ln: 하드 링크 또는 심볼릭 링크를 생성한다. */
     if (strcmp(argv[0], "ln") == 0) {
         int symbolic = argv[1] &&
                        strcmp(argv[1], "-s") == 0;
@@ -662,7 +672,7 @@ int builtin_command(char *argv[]) {
     if (!strcmp(argv[0], "cp"))
         return run_transfer(argv, 0);
 
-    /* cat: 파일의 내용을 터미널에 출력한다. */
+    /* 임채민 담당 — cat: 파일의 내용을 터미널에 출력한다. */
     if (strcmp(argv[0], "cat") == 0) {
         /* 파일명이 없으면 표준 입력을 출력한다. */
         if (!argv[1])
@@ -695,6 +705,7 @@ int builtin_command(char *argv[]) {
     return -1;
 }
 
+/* 공동 실행부: 리다이렉션, 파이프, 자식 프로세스와 작업 제어, 셸 입력 반복 */
 /* 부모에서 실행하는 cd는 표준 입출력을 쓰지 않으므로 파일만 열고 닫는다. */
 static int redirect_file(const char *path, int flags, int target_fd,
                          int connect_stream) {
