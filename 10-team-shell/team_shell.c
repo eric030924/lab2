@@ -302,21 +302,32 @@ int builtin_command(char *argv[]) {
             return 1;
         }
 
-        struct stat a, b;
-
-        /* 원본과 복사 대상이 같은 파일인지 확인한다. */
-        if (stat(argv[1], &a) == 0 &&
-            stat(argv[2], &b) == 0 &&
-            a.st_dev == b.st_dev &&
-            a.st_ino == b.st_ino) {
-            fprintf(stderr, "cp: same file\n");
-            return 1;
-        }
-
         FILE *src = fopen(argv[1], "rb");
 
         if (!src) {
             perror("cp source");
+            return 1;
+        }
+
+        struct stat a, b;
+        if (fstat(fileno(src), &a) == -1) {
+            perror("cp source");
+            fclose(src);
+            return 1;
+        }
+
+        if (S_ISDIR(a.st_mode)) {
+            fprintf(stderr, "cp: source is a directory\n");
+            fclose(src);
+            return 1;
+        }
+
+        /* 원본과 복사 대상이 같은 파일인지 확인한다. */
+        if (stat(argv[2], &b) == 0 &&
+            a.st_dev == b.st_dev &&
+            a.st_ino == b.st_ino) {
+            fprintf(stderr, "cp: same file\n");
+            fclose(src);
             return 1;
         }
 
@@ -408,50 +419,37 @@ int builtin_command(char *argv[]) {
     return -1;
 }
 
-/*
- * 입출력 리다이렉션 처리 함수
- * < 기호는 입력 파일을 지정하고,
- * > 기호는 출력 파일을 지정한다.
- */
-int apply_redirection(Command *cmd) {
-    if (cmd->input != NULL) {
-        int fd = open(cmd->input, O_RDONLY);
+/* 부모에서 실행하는 cd는 표준 입출력을 쓰지 않으므로 파일만 열고 닫는다. */
+static int redirect_file(const char *path, int flags, int target_fd,
+                         int connect_stream) {
+    if (path == NULL)
+        return 0;
 
-        if (fd < 0) {
-            perror("input");
-            return -1;
-        }
-
-        /* 표준 입력을 지정한 파일로 변경한다. */
-        if (dup2(fd, STDIN_FILENO) < 0) {
-            perror("dup2 input");
-            close(fd);
-            return -1;
-        }
-
-        close(fd);
+    int fd = open(path, flags, 0644);
+    if (fd < 0) {
+        perror(path);
+        return -1;
     }
 
-    if (cmd->output != NULL) {
-        int fd = open(cmd->output,
-                      O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (connect_stream && fd == target_fd)
+        return 0;
 
-        if (fd < 0) {
-            perror("output");
-            return -1;
-        }
-
-        /* 표준 출력을 지정한 파일로 변경한다. */
-        if (dup2(fd, STDOUT_FILENO) < 0) {
-            perror("dup2 output");
-            close(fd);
-            return -1;
-        }
-
+    if (connect_stream && dup2(fd, target_fd) == -1) {
+        perror("dup2");
         close(fd);
+        return -1;
     }
 
+    close(fd);
     return 0;
+}
+
+static int apply_redirection(Command *cmd, int connect_stream) {
+    if (redirect_file(cmd->input, O_RDONLY, STDIN_FILENO, connect_stream) < 0)
+        return -1;
+
+    return redirect_file(cmd->output, O_WRONLY | O_CREAT | O_TRUNC,
+                         STDOUT_FILENO, connect_stream);
 }
 
 /* 포그라운드 프로세스 그룹의 종료 또는 중지를 기다린다. */
@@ -555,7 +553,7 @@ void execute_commands(Command cmds[], int count,
                 close(fd[1]);
 
             /* 입력 또는 출력 리다이렉션을 적용한다. */
-            if (apply_redirection(&cmds[i]) == -1)
+            if (apply_redirection(&cmds[i], 1) == -1)
                 _exit(1);
 
             /* 먼저 직접 구현한 명령어인지 확인한다. */
@@ -674,7 +672,8 @@ int main(void) {
         /* cd는 부모 프로세스에서 실행해야 현재 경로가 유지된다. */
         if (count == 1 && !background &&
             strcmp(name, "cd") == 0) {
-            builtin_command(cmds[0].argv);
+            if (apply_redirection(&cmds[0], 0) == 0)
+                builtin_command(cmds[0].argv);
             continue;
         }
 
