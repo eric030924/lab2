@@ -2,6 +2,10 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
+#include <ctype.h>
+#include <stdint.h>
+#include <strings.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -28,66 +32,86 @@ typedef struct {
 /* Ctrl+Z로 중지된 작업의 프로세스 그룹 ID 저장 */
 static pid_t stopped_job = 0;
 
-/*
- * 교재 Exercise 8의 getargs() 기능
- * 사용자가 입력한 명령어를 인자 단위로 분리한다.
- * 추가로 <, >, |, & 기호를 공백 없이 입력해도 인식하도록 처리한다.
- */
-int getargs(const char *line, char *work,
-            size_t size, char *argv[]) {
-    size_t j = 0;
+typedef struct {
+    char *text;
+    char operator;
+} Token;
 
-    for (size_t i = 0; line[i] != '\0'; i++) {
-        char c = line[i];
+/* 따옴표 안의 |와 >를 파일 이름으로 쓸 수 있도록 토큰의 종류도 저장한다. */
+static int getargs(const char *line, char *work, size_t size, Token tokens[]) {
+    size_t used = 0;
+    int count = 0;
 
-        /* 쉘 연산자를 발견하면 앞뒤에 공백을 추가한다. */
-        if (strchr("<>|&", c) != NULL) {
-            if (j + 3 >= size)
-                return -1;
-
-            work[j++] = ' ';
-            work[j++] = c;
-            work[j++] = ' ';
-        } else {
-            if (j + 1 >= size)
-                return -1;
-
-            work[j++] = c;
+    while (*line) {
+        if (isspace((unsigned char)*line)) {
+            line++;
+            continue;
         }
-    }
 
-    work[j] = '\0';
-
-    int narg = 0;
-    char *save = NULL;
-    char *token = strtok_r(work, " \t\r\n", &save);
-
-    /* 공백과 탭을 기준으로 문자열을 분리한다. */
-    while (token != NULL) {
-        if (narg >= MAX_TOKENS - 1)
+        if (count == MAX_TOKENS) {
+            fprintf(stderr, "Too many tokens\n");
             return -1;
+        }
 
-        argv[narg++] = token;
-        token = strtok_r(NULL, " \t\r\n", &save);
+        Token *token = &tokens[count++];
+        token->text = &work[used];
+        token->operator = 0;
+
+        if (strchr("<>|&", *line)) {
+            token->operator = *line++;
+            token->text = NULL;
+            continue;
+        }
+
+        char quote = 0;
+        while (*line) {
+            char c = *line;
+            if (!quote && (isspace((unsigned char)c) || strchr("<>|&", c)))
+                break;
+
+            line++;
+            if (!quote && (c == '\'' || c == '"')) {
+                quote = c;
+                continue;
+            }
+            if (quote && c == quote) {
+                quote = 0;
+                continue;
+            }
+            if (c == '\\' && quote != '\'') {
+                if (!*line) {
+                    fprintf(stderr, "Missing character after backslash\n");
+                    return -1;
+                }
+                if (!quote || *line == '"' || *line == '\\')
+                    c = *line++;
+            }
+
+            if (used + 1 >= size) {
+                fprintf(stderr, "Input too long\n");
+                return -1;
+            }
+            work[used++] = c;
+        }
+
+        if (quote) {
+            fprintf(stderr, "Unclosed quote\n");
+            return -1;
+        }
+        if (used == size) {
+            fprintf(stderr, "Input too long\n");
+            return -1;
+        }
+        work[used++] = '\0';
     }
-
-    /* 인자 배열의 마지막을 NULL로 표시한다. */
-    argv[narg] = NULL;
-
-    return narg;
-}
-
-/* 입력받은 문자열이 쉘 연산자인지 확인한다. */
-int is_operator(const char *s) {
-    return strlen(s) == 1 &&
-           strchr("<>|&", s[0]) != NULL;
+    return count;
 }
 
 /*
  * 분리된 인자들을 실제 실행할 명령어 구조로 변환한다.
  * 파이프, 리다이렉션, 백그라운드 실행 여부를 분석한다.
  */
-int parse_commands(char *tokens[], int count,
+int parse_commands(Token tokens[], int count,
                    Command cmds[], int *background) {
     memset(cmds, 0, sizeof(Command) * MAX_COMMANDS);
 
@@ -97,10 +121,10 @@ int parse_commands(char *tokens[], int count,
     int a = 0;
 
     for (int i = 0; i < count; i++) {
-        char *t = tokens[i];
+        Token token = tokens[i];
 
         /* 파이프 기호를 만나면 다음 명령어를 준비한다. */
-        if (strcmp(t, "|") == 0) {
+        if (token.operator == '|') {
             if (a == 0 || c >= MAX_COMMANDS - 1)
                 return -1;
 
@@ -108,19 +132,18 @@ int parse_commands(char *tokens[], int count,
             a = 0;
 
         /* 입력 또는 출력 리다이렉션 파일을 지정한다. */
-        } else if (strcmp(t, "<") == 0 ||
-                   strcmp(t, ">") == 0) {
+        } else if (token.operator == '<' || token.operator == '>') {
             if (i + 1 >= count ||
-                is_operator(tokens[i + 1]))
+                tokens[i + 1].operator)
                 return -1;
 
-            if (t[0] == '<')
-                cmds[c].input = tokens[++i];
+            if (token.operator == '<')
+                cmds[c].input = tokens[++i].text;
             else
-                cmds[c].output = tokens[++i];
+                cmds[c].output = tokens[++i].text;
 
         /* 명령어 마지막에 &가 있으면 백그라운드로 실행한다. */
-        } else if (strcmp(t, "&") == 0) {
+        } else if (token.operator == '&') {
             if (i != count - 1 || a == 0)
                 return -1;
 
@@ -131,7 +154,7 @@ int parse_commands(char *tokens[], int count,
             if (a >= MAX_ARGS - 1)
                 return -1;
 
-            cmds[c].argv[a++] = t;
+            cmds[c].argv[a++] = token.text;
         }
     }
 
@@ -152,6 +175,413 @@ int copy_stream(FILE *src, FILE *dst) {
     }
 
     return ferror(src) || ferror(dst);
+}
+
+/* 디렉터리 안의 항목을 stat할 때 사용할 경로를 만든다. */
+static char *join_path(const char *directory, const char *name) {
+    size_t length = strlen(directory);
+    int slash = length > 0 && directory[length - 1] != '/';
+    size_t capacity = length + slash + strlen(name) + 1;
+    char *joined = malloc(capacity);
+
+    if (joined == NULL) {
+        perror("path");
+        return NULL;
+    }
+    snprintf(joined, capacity, "%s%s%s", directory, slash ? "/" : "", name);
+    return joined;
+}
+
+static char file_type(mode_t mode) {
+    if (S_ISDIR(mode))  return 'd';
+    if (S_ISLNK(mode))  return 'l';
+    if (S_ISFIFO(mode)) return 'p';
+    if (S_ISCHR(mode))  return 'c';
+    if (S_ISBLK(mode))  return 'b';
+    if (S_ISSOCK(mode)) return 's';
+    return '-';
+}
+
+/* ls -l에 표시할 파일 종류와 소유자·그룹·기타 사용자의 권한 */
+static void format_mode(mode_t mode, char result[11]) {
+    static const mode_t bits[] = {
+        S_IRUSR, S_IWUSR, S_IXUSR,
+        S_IRGRP, S_IWGRP, S_IXGRP,
+        S_IROTH, S_IWOTH, S_IXOTH
+    };
+    result[0] = file_type(mode);
+    for (size_t i = 0; i < 9; i++)
+        result[i + 1] = (mode & bits[i]) ? "rwx"[i % 3] : '-';
+
+    if (mode & S_ISUID)
+        result[3] = (mode & S_IXUSR) ? 's' : 'S';
+    if (mode & S_ISGID)
+        result[6] = (mode & S_IXGRP) ? 's' : 'S';
+    if (mode & 01000)
+        result[9] = (mode & S_IXOTH) ? 't' : 'T';
+    result[10] = '\0';
+}
+
+static void print_long_entry(const char *label, const struct stat *info) {
+    char permissions[11];
+    char date[32];
+    struct tm modified;
+    format_mode(info->st_mode, permissions);
+    if (!localtime_r(&info->st_mtime, &modified) ||
+        !strftime(date, sizeof(date), "%Y-%m-%d %H:%M", &modified))
+        strcpy(date, "?");
+
+    /* 계정 이름을 알 수 없는 환경에서도 소유자를 표시하도록 UID/GID를 사용한다. */
+    printf("%s %ju %ju %ju %jd %s %s\n", permissions,
+           (uintmax_t)info->st_nlink, (uintmax_t)info->st_uid,
+           (uintmax_t)info->st_gid, (intmax_t)info->st_size, date, label);
+}
+
+static int list_path(const char *path, int all, int detailed) {
+    struct stat info;
+    if (lstat(path, &info) == -1) {
+        perror(path);
+        return 1;
+    }
+
+    if (!detailed && S_ISLNK(info.st_mode)) {
+        struct stat target;
+        if (stat(path, &target) == 0)
+            info = target;
+    }
+
+    if (!S_ISDIR(info.st_mode)) {
+        if (detailed)
+            print_long_entry(path, &info);
+        else
+            puts(path);
+        return 0;
+    }
+
+    struct dirent **entries;
+    int count = scandir(path, &entries, NULL, alphasort);
+    if (count < 0) {
+        perror(path);
+        return 1;
+    }
+
+    int result = 0;
+    for (int i = 0; i < count; i++) {
+        const char *name = entries[i]->d_name;
+        if (all || name[0] != '.') {
+            if (!detailed) {
+                puts(name);
+            } else {
+                char *full = join_path(path, name);
+                if (!full) {
+                    result = 1;
+                } else if (lstat(full, &info) == -1) {
+                    perror(full);
+                    result = 1;
+                } else {
+                    print_long_entry(name, &info);
+                }
+                free(full);
+            }
+        }
+        free(entries[i]);
+    }
+    free(entries);
+    return result;
+}
+
+static int run_ls(char *argv[]) {
+    int all = 0, detailed = 0;
+    int i = 1;
+
+    for (; argv[i] && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (strcmp(argv[i], "--") == 0) {
+            i++;
+            break;
+        }
+        for (const char *flag = argv[i] + 1; *flag; flag++) {
+            switch (*flag) {
+            case 'a':
+                all = 1;
+                break;
+            case 'l':
+                detailed = 1;
+                break;
+            default:
+                fprintf(stderr, "Usage: ls [-al] [--] [path ...]\n");
+                return 1;
+            }
+        }
+    }
+    if (!argv[i])
+        return list_path(".", all, detailed);
+
+    int result = 0;
+    int multiple = argv[i + 1] != NULL;
+    int first = i;
+    for (; argv[i]; i++) {
+        if (multiple) {
+            if (i != first)
+                putchar('\n');
+            printf("%s:\n", argv[i]);
+        }
+        if (list_path(argv[i], all, detailed))
+            result = 1;
+    }
+    return result;
+}
+
+typedef struct {
+    int number_lines;
+    int ignore_case;
+    int invert;
+    const char *pattern;
+} GrepOptions;
+
+static int contains_text(const char *line, const GrepOptions *options) {
+    if (!options->ignore_case)
+        return strstr(line, options->pattern) != NULL;
+
+    size_t length = strlen(options->pattern);
+    if (length == 0)
+        return 1;
+
+    for (; *line; line++) {
+        if (!strncasecmp(line, options->pattern, length))
+            return 1;
+    }
+    return 0;
+}
+
+/* 표준 입력과 파일에 같은 줄 번호·문자열 비교 규칙을 적용한다. */
+static int grep_stream(FILE *input, const char *label, int show_name,
+                       const GrepOptions *options) {
+    char *line = NULL;
+    size_t capacity = 0, number = 0;
+    int found = 0;
+
+    while (getline(&line, &capacity, input) >= 0) {
+        number++;
+        if (contains_text(line, options) == options->invert)
+            continue;
+        if (show_name)
+            printf("%s:", label);
+        if (options->number_lines)
+            printf("%zu:", number);
+        fputs(line, stdout);
+        found = 1;
+    }
+    free(line);
+
+    if (ferror(input)) {
+        perror(label);
+        return 2;
+    }
+    return found ? 0 : 1;
+}
+
+static int run_grep(char *argv[]) {
+    GrepOptions options = {0};
+    int i = 1;
+    for (; argv[i] && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (!strcmp(argv[i], "--")) {
+            i++;
+            break;
+        }
+        for (const char *flag = argv[i] + 1; *flag; flag++) {
+            switch (*flag) {
+            case 'n':
+                options.number_lines = 1;
+                break;
+            case 'i':
+                options.ignore_case = 1;
+                break;
+            case 'v':
+                options.invert = 1;
+                break;
+            default:
+                fprintf(stderr, "Usage: grep [-niv] [--] word [file ...]\n");
+                return 2;
+            }
+        }
+    }
+
+    if (!argv[i]) {
+        fprintf(stderr, "grep: pattern required\n");
+        return 2;
+    }
+    options.pattern = argv[i++];
+    if (!argv[i])
+        return grep_stream(stdin, "(standard input)", 0, &options);
+
+    int multiple = argv[i + 1] != NULL;
+    int result = 1;
+    for (; argv[i]; i++) {
+        int use_stdin = !strcmp(argv[i], "-");
+        FILE *input = use_stdin ? stdin : fopen(argv[i], "r");
+        if (!input) {
+            perror(argv[i]);
+            result = 2;
+            continue;
+        }
+
+        const char *label = use_stdin ? "(standard input)" : argv[i];
+        int status = grep_stream(input, label, multiple, &options);
+        if (!use_stdin)
+            fclose(input);
+        if (status == 2 || (status == 0 && result == 1))
+            result = status;
+    }
+    return result;
+}
+
+/* 대상 파일을 열고 같은 inode인지 확인한 뒤 내용을 덮어쓴다. */
+static int copy_file(const char *source, const char *destination) {
+    FILE *input = fopen(source, "rb");
+    if (!input) {
+        perror(source);
+        return 1;
+    }
+
+    struct stat from, to;
+    if (fstat(fileno(input), &from) < 0) {
+        perror(source);
+        fclose(input);
+        return 1;
+    }
+    if (S_ISDIR(from.st_mode)) {
+        fprintf(stderr, "cp: %s: source is a directory\n", source);
+        fclose(input);
+        return 1;
+    }
+
+    int fd = open(destination, O_WRONLY | O_CREAT, 0666);
+    if (fd < 0) {
+        perror(destination);
+        fclose(input);
+        return 1;
+    }
+
+    int result = 1;
+    if (fstat(fd, &to) < 0) {
+        perror(destination);
+    } else if (from.st_dev == to.st_dev && from.st_ino == to.st_ino) {
+        fprintf(stderr, "cp: same file\n");
+    } else if (S_ISREG(to.st_mode) && ftruncate(fd, 0) < 0) {
+        perror(destination);
+    } else {
+        FILE *output = fdopen(fd, "wb");
+        if (!output) {
+            perror(destination);
+        } else {
+            result = copy_stream(input, output);
+            if (fclose(output) != 0)
+                result = 1;
+            if (result)
+                fprintf(stderr, "cp: copy failed: %s\n", destination);
+            fd = -1;
+        }
+    }
+
+    if (fd >= 0)
+        close(fd);
+    fclose(input);
+    return result;
+}
+
+/* 마지막 인자가 디렉터리이면 원본 이름을 그대로 붙여 목적지를 정한다. */
+static char *destination_in(const char *directory, const char *source) {
+    size_t end = strlen(source);
+    while (end && source[end - 1] == '/')
+        end--;
+    if (!end) {
+        fprintf(stderr, "Missing source name\n");
+        return NULL;
+    }
+    size_t start = end;
+    while (start && source[start - 1] != '/')
+        start--;
+
+    char *name = strndup(source + start, end - start);
+    if (!name) {
+        perror("source name");
+        return NULL;
+    }
+    char *destination = join_path(directory, name);
+    free(name);
+    return destination;
+}
+
+static int run_transfer(char *argv[], int move) {
+    int first = argv[1] && !strcmp(argv[1], "--") ? 2 : 1;
+    int count = first;
+    while (argv[count])
+        count++;
+
+    if (count - first < 2) {
+        fprintf(stderr, "Usage: %s source ... destination\n", argv[0]);
+        return 1;
+    }
+
+    const char *target = argv[count - 1];
+    struct stat info;
+    int directory = stat(target, &info) == 0 && S_ISDIR(info.st_mode);
+    if (count - first > 2 && !directory) {
+        fprintf(stderr, "%s: destination must be a directory\n", argv[0]);
+        return 1;
+    }
+
+    int result = 0;
+    for (int i = first; i < count - 1; i++) {
+        char *joined = NULL;
+        if (directory) {
+            joined = destination_in(target, argv[i]);
+            if (!joined) {
+                result = 1;
+                continue;
+            }
+        }
+
+        const char *destination = directory ? joined : target;
+        if (move) {
+            if (rename(argv[i], destination) == -1) {
+                perror(argv[i]);
+                result = 1;
+            }
+        } else if (copy_file(argv[i], destination)) {
+            result = 1;
+        }
+        free(joined);
+    }
+    return result;
+}
+
+/* 경로 하나에 실패해도 나머지 경로는 계속 처리한다. */
+static int change_paths(char *argv[]) {
+    int first = argv[1] && !strcmp(argv[1], "--") ? 2 : 1;
+    if (!argv[first]) {
+        fprintf(stderr, "%s: path required\n", argv[0]);
+        return 1;
+    }
+
+    int create = !strcmp(argv[0], "mkdir");
+    int remove_dir = !strcmp(argv[0], "rmdir");
+    int result = 0;
+    for (int i = first; argv[i]; i++) {
+        int status;
+        if (create)
+            status = mkdir(argv[i], 0755);
+        else if (remove_dir)
+            status = rmdir(argv[i]);
+        else
+            status = unlink(argv[i]);
+
+        if (status == -1) {
+            perror(argv[i]);
+            result = 1;
+        }
+    }
+    return result;
 }
 
 /*
@@ -179,7 +609,15 @@ int builtin_command(char *argv[]) {
     if (strcmp(argv[0], "cd") == 0) {
         const char *path = argv[1] ? argv[1] : getenv("HOME");
 
-        if (path == NULL || chdir(path) == -1) {
+        if (argv[1] && argv[2]) {
+            fprintf(stderr, "cd: too many arguments\n");
+            return 1;
+        }
+        if (!path) {
+            fprintf(stderr, "cd: HOME is not set\n");
+            return 1;
+        }
+        if (chdir(path) == -1) {
             perror("cd");
             return 1;
         }
@@ -187,59 +625,12 @@ int builtin_command(char *argv[]) {
         return 0;
     }
 
-    /* ls: 디렉터리 내부의 파일과 디렉터리 목록을 출력한다. */
-    if (strcmp(argv[0], "ls") == 0) {
-        const char *path = argv[1] ? argv[1] : ".";
-        struct dirent **entries;
+    if (!strcmp(argv[0], "ls"))
+        return run_ls(argv);
 
-        int count = scandir(path, &entries, NULL, alphasort);
-
-        if (count < 0) {
-            perror("ls");
-            return 1;
-        }
-
-        for (int i = 0; i < count; i++) {
-            /* 숨김 파일은 출력하지 않는다. */
-            if (entries[i]->d_name[0] != '.')
-                printf("%s\n", entries[i]->d_name);
-
-            free(entries[i]);
-        }
-
-        free(entries);
-        return 0;
-    }
-
-    /* mkdir: 새로운 디렉터리를 생성한다. */
-    if (strcmp(argv[0], "mkdir") == 0) {
-        if (!argv[1]) {
-            fprintf(stderr, "mkdir: path required\n");
-            return 1;
-        }
-
-        if (mkdir(argv[1], 0755) == -1) {
-            perror("mkdir");
-            return 1;
-        }
-
-        return 0;
-    }
-
-    /* rmdir: 비어 있는 디렉터리를 삭제한다. */
-    if (strcmp(argv[0], "rmdir") == 0) {
-        if (!argv[1]) {
-            fprintf(stderr, "rmdir: path required\n");
-            return 1;
-        }
-
-        if (rmdir(argv[1]) == -1) {
-            perror("rmdir");
-            return 1;
-        }
-
-        return 0;
-    }
+    if (!strcmp(argv[0], "mkdir") || !strcmp(argv[0], "rmdir") ||
+        !strcmp(argv[0], "rm"))
+        return change_paths(argv);
 
     /* ln: 하드 링크 또는 심볼릭 링크를 생성한다. */
     if (strcmp(argv[0], "ln") == 0) {
@@ -265,92 +656,11 @@ int builtin_command(char *argv[]) {
         return 0;
     }
 
-    /* rm: 지정한 파일을 삭제한다. */
-    if (strcmp(argv[0], "rm") == 0) {
-        if (!argv[1]) {
-            fprintf(stderr, "rm: path required\n");
-            return 1;
-        }
+    if (!strcmp(argv[0], "mv"))
+        return run_transfer(argv, 1);
 
-        if (unlink(argv[1]) == -1) {
-            perror("rm");
-            return 1;
-        }
-
-        return 0;
-    }
-
-    /* mv: 파일 이름을 변경하거나 파일을 이동한다. */
-    if (strcmp(argv[0], "mv") == 0) {
-        if (!argv[1] || !argv[2]) {
-            fprintf(stderr, "Usage: mv source destination\n");
-            return 1;
-        }
-
-        if (rename(argv[1], argv[2]) == -1) {
-            perror("mv");
-            return 1;
-        }
-
-        return 0;
-    }
-
-    /* cp: 원본 파일의 내용을 새로운 파일로 복사한다. */
-    if (strcmp(argv[0], "cp") == 0) {
-        if (!argv[1] || !argv[2]) {
-            fprintf(stderr, "Usage: cp source destination\n");
-            return 1;
-        }
-
-        FILE *src = fopen(argv[1], "rb");
-
-        if (!src) {
-            perror("cp source");
-            return 1;
-        }
-
-        struct stat a, b;
-        if (fstat(fileno(src), &a) == -1) {
-            perror("cp source");
-            fclose(src);
-            return 1;
-        }
-
-        if (S_ISDIR(a.st_mode)) {
-            fprintf(stderr, "cp: source is a directory\n");
-            fclose(src);
-            return 1;
-        }
-
-        /* 원본과 복사 대상이 같은 파일인지 확인한다. */
-        if (stat(argv[2], &b) == 0 &&
-            a.st_dev == b.st_dev &&
-            a.st_ino == b.st_ino) {
-            fprintf(stderr, "cp: same file\n");
-            fclose(src);
-            return 1;
-        }
-
-        FILE *dst = fopen(argv[2], "wb");
-
-        if (!dst) {
-            perror("cp destination");
-            fclose(src);
-            return 1;
-        }
-
-        int result = copy_stream(src, dst);
-
-        if (fclose(dst) != 0)
-            result = 1;
-
-        fclose(src);
-
-        if (result)
-            fprintf(stderr, "cp: copy failed\n");
-
-        return result;
-    }
+    if (!strcmp(argv[0], "cp"))
+        return run_transfer(argv, 0);
 
     /* cat: 파일의 내용을 터미널에 출력한다. */
     if (strcmp(argv[0], "cat") == 0) {
@@ -378,42 +688,8 @@ int builtin_command(char *argv[]) {
         return result;
     }
 
-    /* grep: 지정한 문자열이 포함된 줄을 검색한다. */
-    if (strcmp(argv[0], "grep") == 0) {
-        if (!argv[1]) {
-            fprintf(stderr, "Usage: grep word [file]\n");
-            return 1;
-        }
-
-        FILE *file = stdin;
-
-        if (argv[2]) {
-            file = fopen(argv[2], "r");
-
-            if (!file) {
-                perror("grep");
-                return 1;
-            }
-        }
-
-        char *line = NULL;
-        size_t capacity = 0;
-        int found = 0;
-
-        while (getline(&line, &capacity, file) != -1) {
-            if (strstr(line, argv[1]) != NULL) {
-                fputs(line, stdout);
-                found = 1;
-            }
-        }
-
-        free(line);
-
-        if (file != stdin)
-            fclose(file);
-
-        return found ? 0 : 1;
-    }
+    if (!strcmp(argv[0], "grep"))
+        return run_grep(argv);
 
     /* 직접 구현하지 않은 명령어는 외부 실행 대상으로 처리한다. */
     return -1;
@@ -481,6 +757,17 @@ void wait_foreground(pid_t pgid, pid_t shell_pgid,
         tcsetpgrp(STDIN_FILENO, shell_pgid);
 }
 
+/* 파이프 생성 도중 실패하면 이 명령행에서 이미 시작한 자식들을 회수한다. */
+static void cancel_pipeline(pid_t children[], int count) {
+    for (int i = 0; i < count; i++)
+        kill(children[i], SIGKILL);
+
+    for (int i = 0; i < count; i++) {
+        while (waitpid(children[i], NULL, 0) == -1 && errno == EINTR) {
+        }
+    }
+}
+
 /*
  * 교재의 fork(), execvp(), wait() 구조를 확장한 함수
  * 자식 프로세스를 생성하고 명령어를 실행한다.
@@ -491,6 +778,7 @@ void execute_commands(Command cmds[], int count,
                       pid_t shell_pgid) {
     int previous_read = -1;
     pid_t pgid = 0;
+    pid_t children[MAX_COMMANDS];
 
     for (int i = 0; i < count; i++) {
         int fd[2] = {-1, -1};
@@ -498,6 +786,9 @@ void execute_commands(Command cmds[], int count,
         /* 두 명령어 사이에 필요한 파이프를 생성한다. */
         if (i < count - 1 && pipe(fd) == -1) {
             perror("pipe");
+            if (previous_read != -1)
+                close(previous_read);
+            cancel_pipeline(children, i);
             return;
         }
 
@@ -518,6 +809,7 @@ void execute_commands(Command cmds[], int count,
             if (fd[1] != -1)
                 close(fd[1]);
 
+            cancel_pipeline(children, i);
             return;
         }
 
@@ -571,6 +863,8 @@ void execute_commands(Command cmds[], int count,
             _exit(127);
         }
 
+        children[i] = pid;
+
         /* 부모 프로세스에서 프로세스 그룹을 관리한다. */
         if (pgid == 0)
             pgid = pid;
@@ -608,8 +902,10 @@ void execute_commands(Command cmds[], int count,
 int main(void) {
     char line[MAX_LINE];
     char work[MAX_LINE * 3];
-    char *tokens[MAX_TOKENS];
+    Token tokens[MAX_TOKENS];
 
+    /* 자식의 표준 입력에 다음 셸 명령이 미리 읽히지 않도록 한다. */
+    setvbuf(stdin, NULL, _IONBF, 0);
     int interactive = isatty(STDIN_FILENO);
     pid_t shell_pgid = getpgrp();
 
@@ -636,14 +932,25 @@ int main(void) {
         if (fgets(line, sizeof(line), stdin) == NULL)
             break;
 
+        size_t length = strlen(line);
+        if (length && line[length - 1] == '\n') {
+            line[length - 1] = '\0';
+        } else if (length == sizeof(line) - 1) {
+            int next = getchar();
+            if (next != '\n' && next != EOF) {
+                while ((next = getchar()) != '\n' && next != EOF) {
+                }
+                fprintf(stderr, "Input too long\n");
+                continue;
+            }
+        }
+
         /* 입력한 문자열을 명령어와 인자로 분리한다. */
         int narg = getargs(line, work,
                            sizeof(work), tokens);
 
-        if (narg < 0) {
-            fprintf(stderr, "Input too long\n");
+        if (narg < 0)
             continue;
-        }
 
         if (narg == 0)
             continue;
@@ -722,4 +1029,3 @@ int main(void) {
 
     return 0;
 }
-
